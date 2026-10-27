@@ -595,6 +595,11 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
         with open(nombre, "wb") as out:
             for a in range(pos, fin, 16 * MB):
                 out.write(datos[a:min(fin, a + 16 * MB)])
+                if time.time() - ultimo > 0.5:  # los videos grandes tardan en guardarse
+                    _progreso("Analizando", a, total, inicio)
+                    print(f"  guardando {os.path.basename(nombre)} ({(fin - pos) / MB:.0f} MB)   ",
+                          end="", flush=True)
+                    ultimo = time.time()
         cubierto = fin
 
     _progreso("Analizando", total, total, inicio)
