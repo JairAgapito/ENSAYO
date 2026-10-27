@@ -153,7 +153,7 @@ def comprobar(f, inicio, muestras, indices):
 
 def buscar(f, total):
     inicios, indices = [], []
-    p_ftyp = re.compile(rb"ftypXAVC")
+    p_ftyp = re.compile(rb"ftyp(?:XAVC|MSNV|mp4[12]|iso[m2-6]|avc1)")
     p_moov = re.compile(rb"moov....mvhd", re.S)
     t0 = time.time()
     for base in range(0, total, BLOQUE):
@@ -254,12 +254,14 @@ def main():
         m = v["muestras"]
         ultimo = len(m) - 1
         puntos = sorted({ultimo // 4, ultimo // 2, 3 * ultimo // 4, ultimo})
+        todos = range(len(m))
         candidatos = sorted((s for s in inicios if s not in usados), key=lambda s: abs(s - pm))
         elegido, completo, parcial = None, False, None
         for s in candidatos:
             if s + info["fin_datos"] > total or not comprobar(f, s, m, [0, min(1, ultimo)]):
                 continue
-            if comprobar(f, s, m, puntos):  # coincide de principio a fin
+            # coincide de principio a fin: se revisan TODOS los fotogramas
+            if comprobar(f, s, m, puntos) and comprobar(f, s, m, todos):
                 elegido, completo = s, True
                 break
             if parcial is None:  # empieza bien pero algo falla después: guardar por si acaso

@@ -37,7 +37,7 @@ def clip_sony(t, nombre, dur, seg, fuente="testsrc"):
     f = os.path.join(t, nombre)
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
                     f"{fuente}=d={dur}:s=640x360:r=30", "-f", "lavfi", "-i", f"sine=d={dur}",
-                    "-c:v", "libx264", "-g", "15", "-c:a", "aac", "-metadata",
+                    "-vf", "noise=alls=30:allf=t", "-c:v", "libx264", "-g", "15", "-c:a", "aac", "-metadata",
                     f"creation_time=2026-10-{seg:02d}T10:00:00Z", f], check=True)
     d = open(f, "rb").read()
     partes = {tipo: (p, a, b) for tipo, p, a, b in cajas(d, 0, len(d))}
