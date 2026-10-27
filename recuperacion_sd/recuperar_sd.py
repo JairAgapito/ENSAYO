@@ -528,20 +528,24 @@ TODOS_LOS_TIPOS = sorted(set().union(*(f[3] for f in FIRMAS)))
 TIPOS_SONY = ["jpg", "arw", "heic", "mp4", "mts"]
 
 
-def _coincidencias(datos, patrones, cubierto, ventana=256 * MB):
+def _coincidencias(fh, total, patrones, cubierto, ventana=64 * MB):
     """Recorre la imagen por bloques y entrega (posición, nº de firma) en orden.
+    Lee cada bloque de una vez con read(): en discos duros mecánicos es mucho
+    más rápido que dejar que mmap lea la imagen en trocitos.
     Salta los bloques que ya forman parte de un archivo recuperado (ej. un video)."""
-    total = len(datos)
     for base in range(0, total, ventana):
         tope = base + ventana
         if tope <= cubierto():
             continue
         desde = max(base, cubierto())
+        fh.seek(desde)
+        buf = fh.read(min(total, tope + 32) - desde)
         hallados = sorted(
-            (m.start(), k)
+            (m.start() + desde, k)
             for k, p in enumerate(patrones)
-            for m in p.finditer(datos, desde, min(total, tope + 32))
-            if m.start() < tope)
+            for m in p.finditer(buf)
+            if m.start() + desde < tope)
+        del buf
         yield from hallados
 
 
@@ -565,7 +569,9 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
     inicio = time.time()
     ultimo = 0.0
 
-    for m_start, k in _coincidencias(datos, patrones, lambda: cubierto):
+    lector = open(origen, "rb", buffering=0)
+    copiador = open(origen, "rb", buffering=0)
+    for m_start, k in _coincidencias(lector, total, patrones, lambda: cubierto):
         func, desp, _ = firmas[k][1:]
         pos = m_start + desp
         if pos < cubierto or pos < 0:
@@ -593,8 +599,9 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
         os.makedirs(carpeta, exist_ok=True)
         nombre = os.path.join(carpeta, f"{ext}_{num:05d}_off{pos:012x}.{ext}")
         with open(nombre, "wb") as out:
+            copiador.seek(pos)
             for a in range(pos, fin, 16 * MB):
-                out.write(datos[a:min(fin, a + 16 * MB)])
+                out.write(copiador.read(min(fin, a + 16 * MB) - a))
                 if time.time() - ultimo > 0.5:  # los videos grandes tardan en guardarse
                     _progreso("Analizando", a, total, inicio)
                     print(f"  guardando {os.path.basename(nombre)} ({(fin - pos) / MB:.0f} MB)   ",
@@ -603,6 +610,8 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
         cubierto = fin
 
     _progreso("Analizando", total, total, inicio)
+    lector.close()
+    copiador.close()
     datos.close()
     print("\n\nResultado:")
     if not conteo:
