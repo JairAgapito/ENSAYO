@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Recuperador de archivos borrados de memorias SD / USB (file carving).
+Recuperador de fotos y videos borrados de memorias SD de cámaras Sony
+(también sirve si la tarjeta se formateó desde la cámara). Técnica: file carving.
 
 Cuando se borra un archivo, normalmente solo se borra su entrada en la tabla
 del sistema de archivos; los datos siguen en la tarjeta hasta que algo los
@@ -15,7 +16,9 @@ Uso:
        python recuperar_sd.py imagen  ORIGEN  tarjeta.img
      ORIGEN en Windows:  \\\\.\\E:      (letra de la SD, ejecutar como Administrador)
      ORIGEN en Linux:    /dev/sdb      (usar sudo; ver con `lsblk`)
-     ORIGEN en macOS:    /dev/rdisk4   (usar sudo; ver con `diskutil list`)
+     ORIGEN en macOS:    /dev/rdisk4   (usar sudo; ver con `diskutil list external`
+                                        y antes `diskutil unmountDisk /dev/disk4`)
+     En Mac también puedes usar el asistente: bash recuperar_mac.command
 
   2) Recuperar archivos desde la imagen:
        python recuperar_sd.py recuperar tarjeta.img --salida recuperados
@@ -98,6 +101,15 @@ def _leer_por_sectores(fd, pos, bloque):
 
 
 def _tamano_dispositivo(fd):
+    if sys.platform == "darwin":  # en macOS /dev/rdiskN no informa su tamaño con lseek
+        try:
+            import fcntl
+            bs = struct.unpack("I", fcntl.ioctl(fd, 0x40046418, b"\0" * 4))[0]  # DKIOCGETBLOCKSIZE
+            nb = struct.unpack("Q", fcntl.ioctl(fd, 0x40086419, b"\0" * 8))[0]  # DKIOCGETBLOCKCOUNT
+            if bs and nb:
+                return bs * nb
+        except (OSError, ImportError):
+            pass
     try:
         return os.lseek(fd, 0, os.SEEK_END) or None
     except OSError:
@@ -125,7 +137,8 @@ def _progreso(etiqueta, hecho, total, inicio):
 
 MAX = {
     "jpg": 60 * MB, "png": 60 * MB, "gif": 30 * MB, "pdf": 300 * MB,
-    "zip": 500 * MB, "mp4": 16 * 1024 * MB, "riff": 4 * 1024 * MB, "mp3": 50 * MB,
+    "zip": 500 * MB, "mp4": 64 * 1024 * MB, "riff": 4 * 1024 * MB, "mp3": 50 * MB,
+    "raw": 300 * MB, "ts": 64 * 1024 * MB,
 }
 
 
@@ -265,6 +278,8 @@ def fin_mp4(d, i):
         ext = "avif"
     elif marca in (b"M4A ", b"M4B "):
         ext = "m4a"
+    elif marca == b"crx ":
+        ext = "cr3"  # RAW de Canon (EOS R, M50, 90D...)
     else:
         ext = "mp4"
     n = len(d)
@@ -337,6 +352,159 @@ def fin_mp3(d, i):
     return min(p, n), "mp3"
 
 
+# ---- Fotos RAW de cámara basadas en TIFF: CR2, NEF, ARW, DNG, ORF, RW2, PEF...
+_TAM_TIPO = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8,
+             11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
+_TAGS_IFD = (330, 34665, 34853, 40965)  # SubIFDs, EXIF, GPS, Interoperabilidad
+_CABECERAS_ALINEADAS = re.compile(
+    rb"\xff\xd8\xff|II\*\x00|MM\x00\*|IIU\x00|IIRO|FUJIFILM|....ftyp|RIFF|\x89PNG", re.S)
+
+
+def _siguiente_archivo(d, desde, limite):
+    """Primer encabezado de archivo que empiece al inicio de un sector.
+    En FAT/exFAT cada archivo empieza en un bloque nuevo, así que un encabezado
+    alineado a 512 bytes casi seguro es el siguiente archivo."""
+    desde += -desde % SECTOR
+    for m in _CABECERAS_ALINEADAS.finditer(d, desde, limite):
+        if m.start() % SECTOR == 0:
+            return m.start()
+    return limite
+
+
+def fin_tiff(d, i):
+    n = len(d)
+    bo = "<" if d[i] == 0x49 else ">"
+    magia = struct.unpack(bo + "H", d[i + 2:i + 4])[0]
+    if magia not in (42, 0x4F52, 0x5352, 0x55):
+        return None
+    limite = min(n, i + MAX["raw"])
+    fin = i + 8
+    pendientes = [struct.unpack(bo + "I", d[i + 4:i + 8])[0]]
+    vistos, valores, marca, dng = set(), {}, b"", False
+    sin_largo = None  # inicio de datos crudos de tamaño desconocido (RW2)
+
+    def leer(pos, tipo, cuenta):
+        f = {3: "H", 4: "I", 13: "I"}.get(tipo)
+        if not f or cuenta > 100000:
+            return []
+        if _TAM_TIPO[tipo] * cuenta > 4:
+            pos = i + struct.unpack(bo + "I", d[pos:pos + 4])[0]
+        return list(struct.unpack(bo + f * cuenta, d[pos:pos + _TAM_TIPO[tipo] * cuenta]))
+
+    while pendientes and len(vistos) < 64:
+        off = pendientes.pop()
+        if off < 8 or off in vistos or i + off + 2 > limite:
+            continue
+        vistos.add(off)
+        p = i + off
+        num = struct.unpack(bo + "H", d[p:p + 2])[0]
+        if not 1 <= num <= 1000:
+            if len(vistos) == 1:
+                return None
+            continue
+        fin = max(fin, p + 2 + 12 * num + 4)
+        malos = 0
+        tiras = {}
+        for k in range(num):
+            e = p + 2 + 12 * k
+            tag, tipo, cuenta = struct.unpack(bo + "HHI", d[e:e + 8])
+            tam = _TAM_TIPO.get(tipo)
+            if not tam:
+                malos += 1
+                continue
+            total = tam * cuenta
+            if total > 4:
+                voff = struct.unpack(bo + "I", d[e + 8:e + 12])[0]
+                if i + voff + total <= limite:
+                    fin = max(fin, i + voff + total)
+            if tag == 271 and tipo == 2:  # fabricante
+                v = d[e + 8:e + 12] if total <= 4 else d[i + struct.unpack(bo + "I", d[e + 8:e + 12])[0]:][:total]
+                marca = bytes(v).upper()
+            elif tag == 50706:
+                dng = True
+            elif tag in (273, 279, 324, 325, 513, 514, 280) or tag in _TAGS_IFD:
+                tiras[tag] = leer(e + 8, tipo, cuenta)
+        if malos > num // 2:
+            if len(vistos) == 1:
+                return None
+            continue
+        for a, b in ((273, 279), (324, 325), (513, 514)):
+            for o, c in zip(tiras.get(a, []), tiras.get(b, [])):
+                if i + o + c <= limite:
+                    fin = max(fin, i + o + c)
+        if 273 in tiras and 279 not in tiras and tiras[273]:
+            sin_largo = i + tiras[273][0]
+        if 280 in tiras and tiras[280]:  # Panasonic RawDataOffset
+            sin_largo = i + tiras[280][0]
+        for t in _TAGS_IFD:
+            pendientes.extend(tiras.get(t, []))
+        sig = struct.unpack(bo + "I", d[p + 2 + 12 * num:p + 6 + 12 * num])[0]
+        if sig:
+            pendientes.append(sig)
+
+    if sin_largo is not None and sin_largo < limite:
+        fin = max(fin, _siguiente_archivo(d, sin_largo + 1, limite))
+    if fin > n:
+        return None
+
+    if bytes(d[i + 8:i + 10]) == b"CR":
+        ext = "cr2"
+    elif magia in (0x4F52, 0x5352):
+        ext = "orf"
+    elif magia == 0x55:
+        ext = "rw2"
+    elif dng:
+        ext = "dng"
+    elif marca.startswith(b"NIKON"):
+        ext = "nef"
+    elif marca.startswith(b"SONY"):
+        ext = "arw"
+    elif marca.startswith(b"PENTAX") or marca.startswith(b"RICOH"):
+        ext = "pef"
+    elif marca.startswith(b"OLYMPUS") or marca.startswith(b"OM DIGITAL"):
+        ext = "orf"
+    elif marca.startswith(b"SAMSUNG"):
+        ext = "srw"
+    elif marca.startswith(b"CANON"):
+        ext = "cr2"
+    else:
+        ext = "tif"
+    return fin, ext
+
+
+def fin_raf(d, i):
+    """RAW de Fujifilm: la cabecera indica dónde están la vista previa y los datos."""
+    vals = struct.unpack(">IIIIII", d[i + 84:i + 108])
+    fin = i + 108
+    for off, largo in zip(vals[0::2], vals[1::2]):
+        if 0 < largo <= MAX["raw"] and off <= MAX["raw"]:
+            fin = max(fin, i + off + largo)
+    return (fin, "raf") if fin <= len(d) and fin > i + 4096 else None
+
+
+def fin_ts(d, i):
+    """Video AVCHD (.MTS/.M2TS de Sony, Panasonic, Canon) o MPEG-TS.
+    i apunta al byte 0x47 de un paquete PAT."""
+    n = len(d)
+    for paso, adelanto in ((192, 4), (188, 0)):
+        if all(i + k * paso < n and d[i + k * paso] == 0x47 for k in range(1, 6)):
+            break
+    else:
+        return None
+    ini = i - adelanto
+    while ini - paso >= 0 and d[ini - paso + adelanto] == 0x47:  # retroceder al primer paquete
+        ini -= paso
+    p = ini
+    limite = min(n, ini + MAX["ts"])
+    while p + paso <= limite and d[p + adelanto] == 0x47:
+        p += paso
+    if p - ini < 50 * paso:
+        return None
+    return p, ("mts" if paso == 192 else "ts"), ini
+
+
+_TIPOS_TIFF = {"cr2", "nef", "arw", "dng", "orf", "rw2", "pef", "srw", "tif"}
+
 # Firma regex -> (función, desplazamiento de inicio, tipos que puede producir)
 FIRMAS = [
     (rb"\xff\xd8\xff[\xc0-\xfe]", fin_jpeg, 0, {"jpg"}),
@@ -344,17 +512,44 @@ FIRMAS = [
     (rb"GIF8[79]a", fin_gif, 0, {"gif"}),
     (rb"%PDF-1\.", fin_pdf, 0, {"pdf"}),
     (rb"PK\x03\x04", fin_zip, 0, {"zip", "docx", "xlsx", "pptx", "apk"}),
-    (rb"ftyp", fin_mp4, -4, {"mp4", "mov", "3gp", "heic", "avif", "m4a"}),
+    (rb"ftyp", fin_mp4, -4, {"mp4", "mov", "3gp", "heic", "avif", "m4a", "cr3"}),
+    (rb"II\*\x00", fin_tiff, 0, _TIPOS_TIFF),
+    (rb"MM\x00\*", fin_tiff, 0, _TIPOS_TIFF),
+    (rb"IIU\x00", fin_tiff, 0, _TIPOS_TIFF),
+    (rb"IIR[OS]", fin_tiff, 0, _TIPOS_TIFF),
+    (rb"FUJIFILMCCD-RAW ", fin_raf, 0, {"raf"}),
+    (rb"\x47\x40\x00[\x10-\x1f]\x00\x00\xb0", fin_ts, 0, {"mts", "ts"}),
     (rb"RIFF", fin_riff, 0, {"wav", "avi", "webp"}),
     (rb"ID3[\x02-\x04]\x00", fin_mp3, 0, {"mp3"}),
 ]
 TODOS_LOS_TIPOS = sorted(set().union(*(f[3] for f in FIRMAS)))
+# Formatos que graban las cámaras Sony (Alpha, ZV, RX, Handycam):
+# fotos JPG/ARW/HIF y video XAVC S / XAVC HS (.MP4) o AVCHD (.MTS)
+TIPOS_SONY = ["jpg", "arw", "heic", "mp4", "mts"]
+
+
+def _coincidencias(datos, patrones, cubierto, ventana=256 * MB):
+    """Recorre la imagen por bloques y entrega (posición, nº de firma) en orden.
+    Salta los bloques que ya forman parte de un archivo recuperado (ej. un video)."""
+    total = len(datos)
+    for base in range(0, total, ventana):
+        tope = base + ventana
+        if tope <= cubierto():
+            continue
+        desde = max(base, cubierto())
+        hallados = sorted(
+            (m.start(), k)
+            for k, p in enumerate(patrones)
+            for m in p.finditer(datos, desde, min(total, tope + 32))
+            if m.start() < tope)
+        yield from hallados
 
 
 def recuperar(origen, salida, tipos=None, minimo=1024):
     tipos = set(tipos) if tipos else set(TODOS_LOS_TIPOS)
     firmas = [f for f in FIRMAS if f[3] & tipos]
-    patron = re.compile(b"|".join(b"(" + f[0] + b")" for f in firmas))
+    # Una búsqueda por firma: unirlas en un solo regex lo hace ~50 veces más lento.
+    patrones = [re.compile(f[0]) for f in firmas]
 
     with open(origen, "rb") as fh:
         try:
@@ -370,9 +565,9 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
     inicio = time.time()
     ultimo = 0.0
 
-    for m in patron.finditer(datos):
-        func, desp, _ = firmas[m.lastindex - 1][1:]
-        pos = m.start() + desp
+    for m_start, k in _coincidencias(datos, patrones, lambda: cubierto):
+        func, desp, _ = firmas[k][1:]
+        pos = m_start + desp
         if pos < cubierto or pos < 0:
             continue
         ahora = time.time()
@@ -385,7 +580,11 @@ def recuperar(origen, salida, tipos=None, minimo=1024):
             r = None
         if not r:
             continue
-        fin, ext = r
+        fin, ext = r[0], r[1]
+        if len(r) > 2:  # la función encontró un inicio anterior
+            if r[2] < cubierto:
+                continue
+            pos = r[2]
         if ext not in tipos or fin - pos < minimo:
             continue
         num = conteo.get(ext, 0) + 1
@@ -420,17 +619,22 @@ def main(argv=None):
     b = sub.add_parser("recuperar", help="buscar archivos dentro de la imagen")
     b.add_argument("origen", help="archivo .img (o dispositivo en Linux/macOS)")
     b.add_argument("--salida", default="recuperados", help="carpeta destino")
-    b.add_argument("--tipos", help="ej. jpg,png,mp4  (por defecto: todos). Disponibles: "
-                   + ",".join(TODOS_LOS_TIPOS))
+    b.add_argument("--tipos", help="por defecto los de cámaras Sony (" + ",".join(TIPOS_SONY)
+                   + "). Usa 'todos' para buscar todo. Disponibles: " + ",".join(TODOS_LOS_TIPOS))
     b.add_argument("--minimo", type=int, default=1024, help="tamaño mínimo en bytes")
 
     args = ap.parse_args(argv)
     if args.cmd == "imagen":
         crear_imagen(args.origen, args.destino)
     else:
-        tipos = [t.strip().lower().lstrip(".") for t in args.tipos.split(",")] if args.tipos else None
-        if tipos:
-            tipos = ["jpg" if t == "jpeg" else t for t in tipos]
+        if not args.tipos:
+            tipos = TIPOS_SONY
+        elif args.tipos.strip().lower() == "todos":
+            tipos = None
+        else:
+            alias = {"jpeg": "jpg", "hif": "heic", "heif": "heic", "m2ts": "mts"}
+            tipos = [t.strip().lower().lstrip(".") for t in args.tipos.split(",")]
+            tipos = [alias.get(t, t) for t in tipos]
             malos = set(tipos) - set(TODOS_LOS_TIPOS)
             if malos:
                 sys.exit(f"Tipos no soportados: {', '.join(malos)}")
