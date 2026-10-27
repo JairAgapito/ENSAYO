@@ -31,9 +31,10 @@ command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' 2>/dev/null ||
     salir "Falta Python 3. Instálalo desde https://www.python.org/downloads/macos/ y vuelve a ejecutar."
 [ -d "$DESTINO_BASE" ] || salir "La carpeta destino no existe: $DESTINO_BASE"
 
-echo "Discos externos conectados:"
+echo "Discos conectados (busca tu tarjeta por su NOMBRE y TAMAÑO;"
+echo "el lector SD integrado del Mac puede aparecer como 'internal'):"
 echo
-diskutil list external physical
+diskutil list physical
 echo
 read -r -p "Escribe el NÚMERO del disco de tu tarjeta (ej. 4 si dice /dev/disk4): " N
 [[ "$N" =~ ^[0-9]+$ ]] || salir "Número no válido."
